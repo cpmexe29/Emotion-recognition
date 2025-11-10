@@ -2,93 +2,181 @@ import os
 import warnings
 import logging
 
-# Отключаем ВСЕ предупреждения и логи
+# Отключаем лишние предупреждения и логи для чистого вывода
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Отключает логи TensorFlow
-os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # Оптимизация использования GPU
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
-# Подавляем все предупреждения Python
 warnings.filterwarnings('ignore')
 logging.getLogger('tensorflow').setLevel(logging.ERROR)
 
-# Отключаем логирование TensorFlow до импорта
+# Импортируем библиотеки после настройки окружения
 import tensorflow as tf
+import cv2
+from deepface import DeepFace
+import numpy as np
 
+# Удаление лишних сообщений в консоль
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 tf.autograph.set_verbosity(0)
 
-import cv2
-from deepface import DeepFace
-
-# Инициализация веб-камеры
+# Подключаем камеру
 cap = cv2.VideoCapture(0)
 
+# Грузим детектор лиц из OpenCV
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
 if not cap.isOpened():
-    print("Ошибка: Не удалось подключить камеру")
+    print("Не могу подключиться к камере")
     exit()
 
-# Переменные для управления анализом
+# Настройки для анализа
 last_analysis_time = 0
-analysis_interval = 1  # Анализировать каждую секунду
+analysis_interval = 1  # Анализируем раз в секунду
 current_emotion = "Определение..."
 current_confidence = 0
+face_detected = False
+consecutive_no_face_frames = 0
 
-print("Запуск распознавания эмоций. Нажмите 'q' для выхода...")
+print("Запускаю распознавание эмоций. Нажми 'q' чтобы выйти...")
 
+
+def put_text_ru(img, text, position, font_scale=1, color=(255, 255, 255), thickness=2):
+    """
+    Выводим текст на кадр, если русские буквы не работают - заменяем на английские
+    """
+    # Вывод текста в окно
+    cv2.putText(img, text, position, cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale, color, thickness)
+
+
+# Главный цикл обработки видео
 while True:
-    # Захват кадра с камеры
+    # Читаем кадр с камеры
     ret, frame = cap.read()
 
     if not ret:
-        print("Ошибка захвата видео")
+        print("Не могу получить кадр с камеры")
         break
 
-    # Получение текущего времени для интервального анализа
+    # Переводим в черно белое для детектора лиц, лучше распознаёт эмоции
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # Ищем лица в кадре
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(30, 30)
+    )
+
+    # Рисуем рамки вокруг найденных лиц
+    for (x, y, w, h) in faces:
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+
+    # Задержка распознования эмоции перед другой
     current_time = cv2.getTickCount() / cv2.getTickFrequency()
 
-    # Анализ эмоций с заданным интервалом (чтобы не нагружать систему)
+    # Анализируем эмоции интервалами
     if current_time - last_analysis_time > analysis_interval:
-        try:
-            # Анализ доминирующей эмоции с помощью DeepFace
-            results = DeepFace.analyze(
-                img_path=frame,
-                actions=['emotion'],
-                enforce_detection=False,  # Продолжать даже если лицо не обнаружено
-                silent=True
-            )
+        if len(faces) > 0:
+            try:
+                # Отправляем кадр в DeepFace для анализа эмоций
+                results = DeepFace.analyze(
+                    img_path=frame,
+                    actions=['emotion'],
+                    enforce_detection=False,
+                    silent=True,
+                    detector_backend='opencv'
+                )
 
-            # Обработка результатов анализа
-            if results and isinstance(results, list):
-                analysis = results[0]
-                emotion = analysis['dominant_emotion']  # Основная эмоция
-                confidence = analysis['emotion'][emotion]  # Уверенность в %
-                current_emotion = emotion
-                current_confidence = confidence
-                print(f"Эмоция: {emotion} ({confidence:.1f}%)")
-            else:
-                current_emotion = "Лицо не обнаружено"
+                if results and isinstance(results, list):
+                    analysis = results[0]  # Берем первое найденное лицо
+
+                    # Проверяем, что DeepFace тоже увидел лицо
+                    if (analysis.get('region', {}).get('w', 0) > 20 and
+                            analysis.get('region', {}).get('h', 0) > 20):
+
+                        emotion = analysis['dominant_emotion']
+                        confidence = analysis['emotion'][emotion]
+
+                        # Обновляем результаты
+                        current_emotion = emotion
+                        current_confidence = confidence
+                        face_detected = True
+                        consecutive_no_face_frames = 0
+
+                        print(f"Распознано: {emotion} (уверенность: {confidence:.1f}%)")
+
+                    else:
+                        # DeepFace не распознал лицо или не может определить эмоцию
+                        current_emotion = "No face"
+                        current_confidence = 0
+                        face_detected = False
+                        consecutive_no_face_frames += 1
+                        print("DeepFace не смог распознать лицо")
+
+                else:
+                    # Нет эмоции
+                    current_emotion = "No face"
+                    current_confidence = 0
+                    face_detected = False
+                    consecutive_no_face_frames += 1
+                    print("Нет данных от анализатора")
+
+            except Exception as e:
+                # Если что-то пошло не так при анализе
+                print(f"Ошибка при анализе: {e}")
+                current_emotion = "Analysis error"
                 current_confidence = 0
-
-        except Exception as e:
-            print(f"Ошибка анализа: {e}")
-            current_emotion = "Ошибка"
+                face_detected = False
+                consecutive_no_face_frames += 1
+        else:
+            # Лиц в кадре нет
+            current_emotion = "No face"
             current_confidence = 0
+            face_detected = False
+            consecutive_no_face_frames += 1
+
+            if consecutive_no_face_frames == 1:
+                print("В кадре нет лиц")
 
         last_analysis_time = current_time
 
-    # Отображение результата поверх видео
-    cv2.putText(frame, f"Emotion: {current_emotion}", (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-    cv2.putText(frame, f"Confidence: {current_confidence:.1f}%", (20, 80),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 0), 2)
+    # Показываем результаты на экране
 
-    # Показ кадра в окне
-    cv2.imshow('Распознавание эмоций', frame)
+    # Выбираем цвет текста: зеленый если лицо есть, красный если нет
+    if face_detected:
+        text_color = (0, 255, 0)  # Зеленый
+        status_text = f"Emotion: {current_emotion}"
+    else:
+        text_color = (0, 0, 255)  # Красный
+        status_text = "No face"
 
-    # Выход по нажатию 'q'
+    # Выводим основную информацию
+    put_text_ru(frame, status_text, (20, 40), 1, text_color, 2)
+
+    # Дополнительная информация в зависимости от статуса
+    if face_detected:
+        confidence_text = f"Confidence: {current_confidence:.1f}%"
+        put_text_ru(frame, confidence_text, (20, 80), 0.7, text_color, 2)
+    else:
+        # Подсказка пользователю
+        info_text = "Point camera at face"
+        put_text_ru(frame, info_text, (20, 80), 0.7, text_color, 2)
+
+        # Показываем сколько лиц видит OpenCV
+        faces_text = f"OpenCV faces: {len(faces)}"
+        put_text_ru(frame, faces_text, (20, 110), 0.7, (255, 255, 255), 2)
+
+    # Показываем обработанное видео
+    cv2.imshow('Emotion Recognition', frame)
+
+    # Выход по клавише 'q'
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-# Освобождение ресурсов
+# Закрываем рабочие окна
 cap.release()
 cv2.destroyAllWindows()
+print("Работа завершена.")
